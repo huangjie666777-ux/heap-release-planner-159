@@ -1,0 +1,8 @@
+target/
+.m2/
+.env
+.env.*
+*.hprof
+*.nbcache/
+.cache/
+*.log

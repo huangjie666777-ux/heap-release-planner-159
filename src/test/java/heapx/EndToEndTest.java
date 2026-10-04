@@ -158,6 +158,108 @@ class EndToEndTest {
     }
 
     @Test
+    void httpReleasePlan() throws Exception {
+        Path dump = buildDump(Files.createTempDirectory("heapx-plan"));
+        Javalin app = Api.create(new AnalysisService(), 0);
+        String base = "http://localhost:" + app.port();
+        HttpClient http = HttpClient.newHttpClient();
+        try {
+            HttpResponse<String> up = http.send(HttpRequest.newBuilder(URI.create(base + "/api/analyses"))
+                    .header("Content-Type", "application/octet-stream")
+                    .POST(HttpRequest.BodyPublishers.ofFile(dump)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(201, up.statusCode(), up.body());
+            String id = up.body().replaceAll(".*\"analysisId\"\s*:\s*\"([^\"]+)\".*", "$1");
+            String planUrl = base + "/api/analyses/" + id + "/release-plan";
+
+            java.util.function.Function<String, HttpResponse<String>> post = body -> {
+                try {
+                    return http.send(HttpRequest.newBuilder(URI.create(planUrl))
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString(body)).build(),
+                            HttpResponse.BodyHandlers.ofString());
+                } catch (Exception e) { throw new RuntimeException(e); }
+            };
+
+            // feasible: cut 0x2 --demo.Base#ref--> 0x3 for cost 5
+            HttpResponse<String> ok = post.apply(
+                    "{\"targets\":[\"0x3\"],\"candidates\":[{\"from\":\"0x2\",\"via\":\"demo.Base#ref\",\"to\":\"0x3\",\"cost\":5}]}");
+            assertEquals(200, ok.statusCode(), ok.body());
+            assertTrue(ok.body().contains("\"feasible\":true"), ok.body());
+            assertTrue(ok.body().contains("\"totalCost\":5"), ok.body());
+            assertTrue(ok.body().contains("\"count\":1"), ok.body());
+            assertTrue(ok.body().contains("\"0x3\""), ok.body());
+
+            // feasible: cut array element [1] of 0x5 to release the byte[1000]
+            HttpResponse<String> arr = post.apply(
+                    "{\"targets\":[\"0x7\"],\"candidates\":[{\"from\":\"0x5\",\"via\":\"[2]\",\"to\":\"0x7\",\"cost\":3}]}");
+            assertEquals(200, arr.statusCode(), arr.body());
+            assertTrue(arr.body().contains("\"totalCost\":3"), arr.body());
+            assertTrue(arr.body().contains("\"0x7\""), arr.body());
+
+            // planning is read-only: path query still works afterwards
+            HttpResponse<String> path = http.send(HttpRequest.newBuilder(
+                    URI.create(base + "/api/analyses/" + id + "/objects/0x3/path")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, path.statusCode(), path.body());
+
+            // infeasible: 0x6 reachable only via non-candidate edges -> evidence path
+            HttpResponse<String> nope = post.apply("{\"targets\":[\"0x6\"],\"candidates\":[]}");
+            assertEquals(422, nope.statusCode(), nope.body());
+            assertTrue(nope.body().contains("\"feasible\":false"), nope.body());
+            assertTrue(nope.body().contains("[1]"), nope.body()); // evidence uses real labels
+
+            // root as target -> pinned, explained
+            HttpResponse<String> rootT = post.apply("{\"targets\":[\"0x4\"],\"candidates\":[]}");
+            assertEquals(422, rootT.statusCode(), rootT.body());
+            assertTrue(rootT.body().contains("\"targetIsRoot\":true"), rootT.body());
+
+            // already-unreachable target is free
+            HttpResponse<String> free = post.apply("{\"targets\":[\"0x8\"],\"candidates\":[]}");
+            assertEquals(200, free.statusCode(), free.body());
+            assertTrue(free.body().contains("\"totalCost\":0"), free.body());
+            assertTrue(free.body().contains("\"count\":0"), free.body());
+
+            // validation: duplicate candidate
+            HttpResponse<String> dup = post.apply(
+                    "{\"targets\":[\"0x3\"],\"candidates\":["
+                            + "{\"from\":\"0x2\",\"via\":\"demo.Base#ref\",\"to\":\"0x3\",\"cost\":5},"
+                            + "{\"from\":\"0x2\",\"via\":\"demo.Base#ref\",\"to\":\"0x3\",\"cost\":7}]}");
+            assertEquals(400, dup.statusCode(), dup.body());
+
+            // validation: non-positive cost
+            HttpResponse<String> badCost = post.apply(
+                    "{\"targets\":[\"0x3\"],\"candidates\":[{\"from\":\"0x2\",\"via\":\"demo.Base#ref\",\"to\":\"0x3\",\"cost\":0}]}");
+            assertEquals(400, badCost.statusCode(), badCost.body());
+
+            // validation: reference does not exist
+            HttpResponse<String> noEdge = post.apply(
+                    "{\"targets\":[\"0x3\"],\"candidates\":[{\"from\":\"0x2\",\"via\":\"demo.Base#nope\",\"to\":\"0x3\",\"cost\":1}]}");
+            assertEquals(400, noEdge.statusCode(), noEdge.body());
+
+            // validation: unknown object id
+            HttpResponse<String> unknown = post.apply(
+                    "{\"targets\":[\"0xdead\"],\"candidates\":[]}");
+            assertEquals(400, unknown.statusCode(), unknown.body());
+
+            // validation: too many targets
+            StringBuilder many = new StringBuilder("{\"targets\":[");
+            for (int i = 0; i < 33; i++) many.append(i == 0 ? "" : ",").append("\"0x").append(Integer.toHexString(i % 11 + 1)).append("\"");
+            many.append("],\"candidates\":[]}");
+            HttpResponse<String> tooMany = post.apply(many.toString());
+            assertEquals(400, tooMany.statusCode(), tooMany.body());
+
+            // delete -> planning no longer possible
+            http.send(HttpRequest.newBuilder(URI.create(base + "/api/analyses/" + id)).DELETE().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> gone = post.apply("{\"targets\":[\"0x3\"],\"candidates\":[]}");
+            assertEquals(404, gone.statusCode(), gone.body());
+        } finally {
+            app.stop();
+        }
+    }
+
+    @Test
     void parserRejectsOverLimit() throws Exception {
         Path dump = buildDump(Files.createTempDirectory("heapx-limit"));
         HprofParser tiny = new HprofParser(3, 200000);

@@ -175,4 +175,108 @@ class EndToEndTest {
             assertEquals(422, e.status);
         }
     }
+
+    @Test
+    void httpCutPlan() throws Exception {
+        Path dump = buildDump(Files.createTempDirectory("heapx-cut"));
+        Javalin app = Api.create(new AnalysisService(), 0);
+        String base = "http://localhost:" + app.port();
+        HttpClient http = HttpClient.newHttpClient();
+        try {
+            HttpResponse<String> up = http.send(HttpRequest.newBuilder(URI.create(base + "/api/analyses"))
+                    .header("Content-Type", "application/octet-stream")
+                    .POST(HttpRequest.BodyPublishers.ofFile(dump)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(201, up.statusCode(), up.body());
+            String id = up.body().replaceAll(".*\"analysisId\"\s*:\s*\"([^\"]+)\".*", "$1");
+            String url = base + "/api/analyses/" + id + "/cut-plan";
+
+            // target 0x7 (byte[1000]): cut [2] for 3 instead of demo.Sub#arr for 10
+            String req = """
+                    {"targets":["0x7"],"candidates":[
+                      {"source":"0x1","via":"demo.Sub#arr","target":"0x5","cost":10},
+                      {"source":"0x5","via":"[2]","target":"0x7","cost":3}]}
+                    """;
+            HttpResponse<String> plan = post(http, url, req);
+            assertEquals(200, plan.statusCode(), plan.body());
+            assertTrue(plan.body().contains("\"feasible\":true"), plan.body());
+            assertTrue(plan.body().contains("\"totalCost\":3"), plan.body());
+            assertTrue(plan.body().contains("\"via\":\"[2]\""), plan.body());
+            assertFalse(plan.body().contains("demo.Sub#arr\",\"target"), plan.body());
+            // newly unreachable: exactly object 0x7 with its shallow bytes
+            assertTrue(plan.body().contains("\"count\":1"), plan.body());
+            assertTrue(plan.body().contains("0x7"), plan.body());
+            assertFalse(plan.body().contains("0x8"), plan.body()); // pre-unreachable not counted
+
+            // two targets sharing the prefix: cutting 0x1->0x5 (10) loses to [1]+[2] (4+3)
+            String req2 = """
+                    {"targets":["0x6","0x7"],"candidates":[
+                      {"source":"0x1","via":"demo.Sub#arr","target":"0x5","cost":10},
+                      {"source":"0x5","via":"[1]","target":"0x6","cost":4},
+                      {"source":"0x5","via":"[2]","target":"0x7","cost":3}]}
+                    """;
+            HttpResponse<String> plan2 = post(http, url, req2);
+            assertEquals(200, plan2.statusCode(), plan2.body());
+            assertTrue(plan2.body().contains("\"totalCost\":7"), plan2.body());
+            assertTrue(plan2.body().contains("\"count\":2"), plan2.body());
+
+            // already unreachable target: free
+            HttpResponse<String> free = post(http, url, "{\"targets\":[\"0x9\"],\"candidates\":[]}");
+            assertEquals(200, free.statusCode(), free.body());
+            assertTrue(free.body().contains("\"totalCost\":0"), free.body());
+            assertTrue(free.body().contains("\"alreadyUnreachableTargets\":[\"0x9\"]"), free.body());
+
+            // infeasible: 0x2->0x3 not cuttable -> evidence path over uncuttable edges
+            String reqInf = """
+                    {"targets":["0x3"],"candidates":[
+                      {"source":"0x1","via":"demo.Base#ref","target":"0x2","cost":5}]}
+                    """;
+            HttpResponse<String> inf = post(http, url, reqInf);
+            assertEquals(422, inf.statusCode(), inf.body());
+            assertTrue(inf.body().contains("\"feasible\":false"), inf.body());
+            assertTrue(inf.body().contains("demo.Base#ref"), inf.body());
+
+            // root as target -> explained
+            HttpResponse<String> rootT = post(http, url, "{\"targets\":[\"0xa\"],\"candidates\":[]}");
+            assertEquals(422, rootT.statusCode(), rootT.body());
+            assertTrue(rootT.body().contains("\"targetIsRoot\":true"), rootT.body());
+
+            // validation failures
+            assertEquals(400, post(http, url,
+                    "{\"targets\":[\"0x7\"],\"candidates\":[{\"source\":\"0x5\",\"via\":\"[2]\",\"target\":\"0x7\",\"cost\":0}]}").statusCode());
+            assertEquals(400, post(http, url,
+                    "{\"targets\":[\"0x7\"],\"candidates\":[{\"source\":\"0x5\",\"via\":\"[2]\",\"target\":\"0x7\",\"cost\":1000000001}]}").statusCode());
+            String dup = """
+                    {"targets":["0x7"],"candidates":[
+                      {"source":"0x5","via":"[2]","target":"0x7","cost":1},
+                      {"source":"0x5","via":"[2]","target":"0x7","cost":2}]}
+                    """;
+            assertEquals(400, post(http, url, dup).statusCode());
+            assertEquals(400, post(http, url,
+                    "{\"targets\":[\"0x7\"],\"candidates\":[{\"source\":\"0x5\",\"via\":\"[9]\",\"target\":\"0x7\",\"cost\":1}]}").statusCode());
+            assertEquals(400, post(http, url,
+                    "{\"targets\":[\"0xdead\"],\"candidates\":[]}").statusCode());
+
+            // planning is read-only: ranking unchanged afterwards
+            HttpResponse<String> rank = http.send(HttpRequest.newBuilder(
+                    URI.create(base + "/api/analyses/" + id + "/retained?limit=5")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, rank.statusCode());
+            assertTrue(rank.body().contains("\"retainedBytes\":1096"), rank.body());
+
+            // after delete, planning is gone too
+            http.send(HttpRequest.newBuilder(URI.create(base + "/api/analyses/" + id)).DELETE().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(404, post(http, url, "{\"targets\":[\"0x7\"],\"candidates\":[]}").statusCode());
+        } finally {
+            app.stop();
+        }
+    }
+
+    private static HttpResponse<String> post(HttpClient http, String url, String json) throws Exception {
+        return http.send(HttpRequest.newBuilder(URI.create(url))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(json)).build(),
+                HttpResponse.BodyHandlers.ofString());
+    }
 }

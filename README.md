@@ -48,7 +48,65 @@ java -jar target/heapx-1.0.0-jar-with-dependencies.jar
 | GET | `/api/analyses/{id}/retained?limit=50&offset=0` | 按保留字节降序的对象列表 |
 | GET | `/api/analyses/{id}/objects/{hexId}` | 单个对象：类、浅堆、保留量、立即支配者 |
 | GET | `/api/analyses/{id}/objects/{hexId}/path` | 到任一根的最短强引用路径（逐边字段/下标） |
+| POST | `/api/analyses/{id}/cut-plan` | 最低代价断引用规划：使目标对象全部不可达的最小代价引用集合 |
 | DELETE | `/api/analyses/{id}` | 删除分析并释放资源 |
+
+## 断引用规划（cut-plan）
+
+请求体（JSON）：
+
+```json
+{
+  "targets": ["0x7090176a8", "0x7090276b8"],
+  "candidates": [
+    {"source": "0x709017690", "via": "java.util.ArrayList#elementData",
+     "target": "0x7090676f8", "cost": 15},
+    {"source": "0x7090676f8", "via": "[0]", "target": "0x7090176a8", "cost": 10}
+  ]
+}
+```
+
+- `targets`：要释放的对象 ID（十六进制，1–32 个，必须存在）。
+- `candidates`：允许断开的强引用清单（≤1000 条）。`via` 与图查询返回的引用
+  标签一致（`声明类#字段名` 或 `[下标]`）；`cost` 为 1–1,000,000,000 的整数。
+  源/目标对象必须存在、引用必须真实存在；重复候选、非法代价、不存在的引用
+  一律 400 拒绝。
+- 求解口径：所有 GC 根与静态引用目标是固定根，仅候选中的引用可断开。
+  在所有目标上做**一次**最小 s-t 割（超源→各根、各目标→超汇，不可断边容量
+  无穷），精确给出使全部目标不可达的最小总代价集合——共享前缀只付一次，
+  环、多根、同对象间不同字段都联合优化，等价最优解返回任意一个。
+  已不可达的目标不产生费用。
+
+成功响应（200）：
+
+```json
+{
+  "feasible": true,
+  "totalCost": 15,
+  "cuts": [{"source": "0x709017690", "via": "java.util.ArrayList#elementData",
+            "target": "0x7090676f8", "cost": 15}],
+  "newlyUnreachable": {"count": 21, "shallowBytes": 1311400, "ids": ["0x..."]},
+  "alreadyUnreachableTargets": []
+}
+```
+
+`newlyUnreachable` 是断开前后根可达集合之差（新增不可达对象 ID、数量、
+浅堆字节总和），原本不可达的对象不计入，也不使用任何旧保留值累加。
+
+无解响应（422）：附一条完全由不可断引用组成的根→目标证据路径；
+目标本身是根时 `targetIsRoot: true` 且路径为空。
+
+```json
+{
+  "feasible": false,
+  "error": "target stays reachable through references that are not in the cuttable list",
+  "evidence": {"target": "0x7090176a8", "targetIsRoot": false,
+               "uncuttablePath": [{"from": "0x709017690", "via": "...", "to": "0x..."}]}
+}
+```
+
+规划是只读操作：不改变原图、保留排名与路径查询；请求间完全隔离；
+分析删除后再规划返回 404。
 
 ## curl 演示（真实堆转储）
 
@@ -77,6 +135,15 @@ curl -s "http://localhost:7717/api/analyses/<analysisId>/retained?limit=5"
 # 根路径：ArrayList --elementData--> Object[] --[0]--> byte[]
 curl -s "http://localhost:7717/api/analyses/<analysisId>/objects/0xfc01ded0/path"
 
+# 断引用规划：断开 elementData（代价 15）一次释放整个缓存
+curl -s -X POST "http://localhost:7717/api/analyses/<analysisId>/cut-plan" \
+  -H 'Content-Type: application/json' \
+  -d '{"targets":["0xfc01ded0"],"candidates":[
+        {"source":"0x...","via":"java.util.ArrayList#elementData","target":"0x...","cost":15},
+        {"source":"0x...","via":"[0]","target":"0xfc01ded0","cost":10}]}'
+# => {"feasible":true,"totalCost":15,"cuts":[...elementData...],
+#     "newlyUnreachable":{"count":21,"shallowBytes":1311400,...}}
+
 # 释放
 curl -s -X DELETE "http://localhost:7717/api/analyses/<analysisId>"
 ```
@@ -87,6 +154,8 @@ curl -s -X DELETE "http://localhost:7717/api/analyses/<analysisId>"
 - `heapx.model.HeapModel` — 不可变图（CSR 正/反邻接，id 索引）
 - `heapx.graph.DominatorAnalysis` — 虚拟根 + 立即支配者 + 保留量 + 不可达标记
 - `heapx.graph.PathFinder` — 反向 BFS 求到根的最短强引用路径
+- `heapx.graph.CutPlanner` — 超源/超汇最小 s-t 割（Dinic）求最低代价断引用方案，
+  含不可断证据路径与可达集合差计算
 - `heapx.service.AnalysisService` — 分析注册表、限制、并发隔离、删除
 - `heapx.http.Api` / `heapx.Main` — Javalin 路由与启动
 
@@ -98,7 +167,11 @@ mvn -B test
 
 - `DominatorAnalysisTest`：合成图验证支配语义（链上共享节点、环、多根共享、
   不可达标记、最短路径用真实边而非支配树边）。
+- `CutPlannerTest`：合成图验证最小割语义（共享前缀只断一次、非最短路径上的
+  边、环与同对象平行字段、多根、不可断证据、根作为目标、已不可达目标免费、
+  新增不可达集合为可达集差）。
 - `EndToEndTest`：用自写 HPROF 生成器（4 字节 ID）产出真实转储文件，
   覆盖静态根、JNI 根、继承字段、对象/原始数组、`Reference.referent` 排除、
-  不可达对象，并走完整 HTTP 上传 → 排行 → 根路径 → 删除流程；
-  另验证对象/边超限与损坏文件拒绝。
+  不可达对象，并走完整 HTTP 上传 → 排行 → 根路径 → 断引用规划 → 删除流程；
+  另验证对象/边超限、损坏文件与非法规划请求（重复候选、非法代价、
+  不存在的引用）的拒绝。

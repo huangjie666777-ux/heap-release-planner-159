@@ -1,22 +1,31 @@
 package heapx.http;
 
 import heapx.graph.PathFinder;
+import heapx.graph.CutPlanner;
 import heapx.model.HeapModel;
 import heapx.parse.AnalysisException;
 import heapx.service.Analysis;
 import heapx.service.AnalysisService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.HttpStatus;
 
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
-/** Javalin routes for upload, retained ranking, root paths and delete. */
+/** Javalin routes for upload, retained ranking, root paths, cut plans and delete. */
 public final class Api {
+    private static final ObjectMapper JSON = new ObjectMapper();
+    static final int MAX_TARGETS = 32;
+    static final int MAX_CANDIDATES = 1000;
+    static final long MAX_COST = 1_000_000_000L;
 
     public static Javalin create(AnalysisService service, int port) {
         Javalin app = Javalin.create(cfg -> {
@@ -123,8 +132,203 @@ public final class Api {
             }
         });
 
+        app.post("/api/analyses/{id}/cut-plan", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            JsonNode body;
+            try {
+                body = JSON.readTree(ctx.body());
+            } catch (Exception e) {
+                badRequest(ctx, "invalid JSON body");
+                return;
+            }
+            if (body == null || !body.isObject()) {
+                badRequest(ctx, "JSON object with 'targets' and 'candidates' expected");
+                return;
+            }
+            int[] targets = parseTargets(ctx, a, body.get("targets"));
+            if (targets == null) return;
+            List<CutPlanner.Candidate> candidates = parseCandidates(ctx, a, body.get("candidates"));
+            if (candidates == null) return;
+
+            HeapModel g = a.model;
+            CutPlanner.Result res = CutPlanner.plan(g, targets, candidates);
+            if (!res.feasible()) {
+                Map<String, Object> evidence = new LinkedHashMap<>();
+                int t = res.evidenceTarget();
+                evidence.put("target", hex(g.ids[t]));
+                evidence.put("targetIsRoot", g.root[t]);
+                List<Map<String, Object>> path = new ArrayList<>();
+                for (PathFinder.Step s : res.evidence()) {
+                    Map<String, Object> e = new LinkedHashMap<>();
+                    e.put("from", hex(s.fromId()));
+                    e.put("fromClass", s.fromClass());
+                    e.put("via", s.via());
+                    e.put("to", hex(s.toId()));
+                    e.put("toClass", s.toClass());
+                    path.add(e);
+                }
+                evidence.put("uncuttablePath", path);
+                Map<String, Object> resp = new LinkedHashMap<>();
+                resp.put("analysisId", a.id);
+                resp.put("feasible", false);
+                resp.put("error", g.root[t]
+                        ? "target is a GC root / static-reference target and cannot be disconnected"
+                        : "target stays reachable through references that are not in the cuttable list");
+                resp.put("evidence", evidence);
+                ctx.status(HttpStatus.forStatus(422)).json(resp);
+                return;
+            }
+
+            boolean[] removed = new boolean[g.edgeCount()];
+            List<Map<String, Object>> cuts = new ArrayList<>();
+            for (CutPlanner.Candidate c : res.cuts()) {
+                removed[c.edgeIndex()] = true;
+                Map<String, Object> e = new LinkedHashMap<>();
+                e.put("source", hex(g.ids[c.from()]));
+                e.put("via", c.label());
+                e.put("target", hex(g.ids[c.to()]));
+                e.put("cost", c.cost());
+                cuts.add(e);
+            }
+            // newly unreachable = root-reachable set difference before/after the cut
+            boolean[] before = CutPlanner.reachableFrom(g, null);
+            boolean[] after = CutPlanner.reachableFrom(g, removed);
+            List<String> freedIds = new ArrayList<>();
+            long freedBytes = 0;
+            for (int i = 0; i < g.nodeCount(); i++) {
+                if (before[i] && !after[i]) {
+                    freedIds.add(hex(g.ids[i]));
+                    freedBytes += g.shallow[i];
+                }
+            }
+            List<String> alreadyDead = new ArrayList<>();
+            for (int t : targets) {
+                if (a.dominators.unreachable[t]) alreadyDead.add(hex(g.ids[t]));
+            }
+            Map<String, Object> freed = new LinkedHashMap<>();
+            freed.put("count", freedIds.size());
+            freed.put("shallowBytes", freedBytes);
+            freed.put("ids", freedIds);
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("analysisId", a.id);
+            resp.put("feasible", true);
+            resp.put("totalCost", res.totalCost());
+            resp.put("cuts", cuts);
+            resp.put("newlyUnreachable", freed);
+            resp.put("alreadyUnreachableTargets", alreadyDead);
+            ctx.json(resp);
+        });
+
         app.start(port);
         return app;
+    }
+
+    private static int[] parseTargets(Context ctx, Analysis a, JsonNode node) {
+        if (node == null || !node.isArray() || node.isEmpty()) {
+            badRequest(ctx, "targets must be a non-empty array of hex object ids");
+            return null;
+        }
+        if (node.size() > MAX_TARGETS) {
+            badRequest(ctx, "target limit exceeded: " + node.size() + " > " + MAX_TARGETS);
+            return null;
+        }
+        HeapModel g = a.model;
+        int[] targets = new int[node.size()];
+        Set<Integer> seen = new HashSet<>();
+        int count = 0;
+        for (JsonNode t : node) {
+            if (!t.isTextual()) {
+                badRequest(ctx, "each target must be a hex object id string");
+                return null;
+            }
+            long id;
+            try {
+                id = parseHex(t.asText());
+            } catch (NumberFormatException e) {
+                badRequest(ctx, "invalid hex object id: " + t.asText());
+                return null;
+            }
+            Integer idx = g.indexOf(id);
+            if (idx == null) {
+                badRequest(ctx, "unknown target object id: " + t.asText());
+                return null;
+            }
+            if (seen.add(idx)) targets[count++] = idx;
+        }
+        return count == targets.length ? targets : java.util.Arrays.copyOf(targets, count);
+    }
+
+    private static List<CutPlanner.Candidate> parseCandidates(Context ctx, Analysis a, JsonNode node) {
+        if (node == null || !node.isArray()) {
+            badRequest(ctx, "candidates must be an array of {source, via, target, cost}");
+            return null;
+        }
+        if (node.size() > MAX_CANDIDATES) {
+            badRequest(ctx, "candidate limit exceeded: " + node.size() + " > " + MAX_CANDIDATES);
+            return null;
+        }
+        HeapModel g = a.model;
+        List<CutPlanner.Candidate> candidates = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (JsonNode c : node) {
+            JsonNode source = c.get("source");
+            JsonNode via = c.get("via");
+            JsonNode target = c.get("target");
+            JsonNode cost = c.get("cost");
+            if (source == null || !source.isTextual() || via == null || !via.isTextual()
+                    || target == null || !target.isTextual() || cost == null) {
+                badRequest(ctx, "each candidate needs string source/via/target and integer cost");
+                return null;
+            }
+            if (!cost.isIntegralNumber() || !cost.canConvertToLong()
+                    || cost.longValue() < 1 || cost.longValue() > MAX_COST) {
+                badRequest(ctx, "cost must be an integer in [1, " + MAX_COST + "]: " + cost);
+                return null;
+            }
+            Integer from = lookup(ctx, g, source.asText());
+            if (from == null) return null;
+            Integer to = lookup(ctx, g, target.asText());
+            if (to == null) return null;
+            String key = from + "|" + via.asText() + "|" + to;
+            if (!seen.add(key)) {
+                badRequest(ctx, "duplicate candidate: " + source.asText()
+                        + " --" + via.asText() + "--> " + target.asText());
+                return null;
+            }
+            int edge = findEdge(g, from, to, via.asText());
+            if (edge < 0) {
+                badRequest(ctx, "no such reference: " + source.asText()
+                        + " --" + via.asText() + "--> " + target.asText());
+                return null;
+            }
+            candidates.add(new CutPlanner.Candidate(from, to, via.asText(), cost.longValue(), edge));
+        }
+        return candidates;
+    }
+
+    private static Integer lookup(Context ctx, HeapModel g, String hexId) {
+        long id;
+        try {
+            id = parseHex(hexId);
+        } catch (NumberFormatException e) {
+            badRequest(ctx, "invalid hex object id: " + hexId);
+            return null;
+        }
+        Integer idx = g.indexOf(id);
+        if (idx == null) badRequest(ctx, "unknown object id: " + hexId);
+        return idx;
+    }
+
+    private static int findEdge(HeapModel g, int from, int to, String label) {
+        for (int e = g.outStart[from]; e < g.outStart[from + 1]; e++) {
+            if (g.outTo[e] == to && g.outLabel[e].equals(label)) return e;
+        }
+        return -1;
+    }
+
+    private static void badRequest(Context ctx, String message) {
+        ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", message));
     }
 
     private static InputStream bodyOf(Context ctx) throws Exception {
